@@ -91,11 +91,11 @@ def main(args):
             if epoch == 1:
                 csvw.writerow([
                     'time', 'duration', 'epoch', 'train_loss',
-                    'validation_loss', 'validation_mean', 'validation_median'
+                    'validation_loss', 'validation_mean', 'validation_median', 'lr'
                 ])
             csvw.writerow([
                 datetime.today(), int(duration), epoch,
-                train_loss, val_loss, val_mean, val_median,
+                train_loss, val_loss, val_mean, val_median, optimizer.param_groups[0]['lr']
             ])
 
 
