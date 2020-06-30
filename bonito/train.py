@@ -11,7 +11,9 @@ from argparse import ArgumentParser
 from argparse import ArgumentDefaultsHelpFormatter
 
 from bonito.model import Model
-from bonito.training import ChunkDataSet, load_state, train, test
+from bonito.training import (
+    ChunkDataSet, load_state, train, test, func_scheduler, cosine_decay_schedule, CSVLogger
+)
 from bonito.util import load_data, init, default_config, default_data
 
 import toml
@@ -29,6 +31,8 @@ def main(args):
     if os.path.exists(workdir) and not args.force:
         print("[error] %s exists, use -f to force continue training." % workdir)
         exit(1)
+        
+    training_log = CSVLogger(workdir, 'training')
 
     init(args.seed, args.device)
     device = torch.device(args.device)
@@ -55,7 +59,7 @@ def main(args):
 
     print("[loading model]")
     model = Model(config)
-    optimizer = AdamW(model.parameters(), amsgrad=True, lr=args.lr)
+    optimizer = AdamW(model.parameters(), amsgrad=False, lr=args.lr)
     last_epoch = load_state(workdir, args.device, model, optimizer, use_amp=args.amp)
 
     if args.multi_gpu:
@@ -65,13 +69,16 @@ def main(args):
         model.stride = model.module.stride
         model.alphabet = model.module.alphabet
 
-    schedular = CosineAnnealingLR(optimizer, args.epochs * len(train_loader))
+    lr_scheduler = func_scheduler(
+        optimizer, cosine_decay_schedule(1.0, 0.1), args.epochs * len(train_loader), 
+        warmup_steps=500, start_step=last_epoch*len(train_loader)
+    )
 
     for epoch in range(1 + last_epoch, args.epochs + 1 + last_epoch):
 
         try:
             train_loss, duration = train(
-                model, device, train_loader, optimizer, use_amp=args.amp
+                model, device, train_loader, optimizer, use_amp=args.amp, lr_scheduler=lr_scheduler
             )
             val_loss, val_mean, val_median = test(model, device, test_loader)
         except KeyboardInterrupt:
@@ -84,20 +91,12 @@ def main(args):
         model_state = model.state_dict() if not args.multi_gpu else model.module.state_dict()
         torch.save(model_state, os.path.join(workdir, "weights_%s.tar" % epoch))
         torch.save(optimizer.state_dict(), os.path.join(workdir, "optim_%s.tar" % epoch))
-
-        with open(os.path.join(workdir, 'training.csv'), 'a', newline='') as csvfile:
-            csvw = csv.writer(csvfile, delimiter=',')
-            if epoch == 1:
-                csvw.writerow([
-                    'time', 'duration', 'epoch', 'train_loss',
-                    'validation_loss', 'validation_mean', 'validation_median'
-                ])
-            csvw.writerow([
-                datetime.today(), int(duration), epoch,
-                train_loss, val_loss, val_mean, val_median,
-            ])
-
-        schedular.step()
+ 
+        training_log.append({
+            'time': datetime.today(), 'duration': duration, 'epoch': epoch, 'train_loss': train_loss, 
+            'validation_loss': val_loss, 'validation_mean': val_mean, 'validation_median': val_median, 
+            'lr': optimizer.param_groups[0]['lr']
+        })       
 
 
 def argparser():

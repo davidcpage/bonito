@@ -7,20 +7,46 @@ import re
 import time
 from glob import glob
 from itertools import starmap
+from functools import partial
 
-from bonito.util import accuracy, decode_ref
+from bonito.util import accuracy, decode_ref, load_data, union
 
 import torch
 import numpy as np
 import torch.nn as nn
 from tqdm import tqdm
+import pandas as pd
 
 try: from apex import amp
 except ImportError: pass
 
 
-criterion = nn.CTCLoss(reduction='mean')
+def const_schedule(y):
+    return lambda t: y
 
+
+def linear_schedule(y0, y1):
+    return lambda t: y0 + (y1 - y0)*t
+
+
+def cosine_decay_schedule(y0, y1):
+    return lambda t: y1 + 0.5*(y0 - y1)*(np.cos(t*np.pi) + 1.)
+
+
+def piecewise_schedule(knots, funcs):
+    def f(t):
+        i = np.searchsorted(knots, t)
+        t0 = 0. if i == 0 else knots[i-1]
+        t1 = 1. if i == len(knots) else knots[i]
+        return funcs[i]((t-t0)/(t1-t0))
+    return f
+
+
+def func_scheduler(optimizer, func, total_steps, warmup_steps=None, warmup_ratio=0.1, start_step=0):
+    if warmup_steps:
+        y0 = func(0.) 
+        func = piecewise_schedule([warmup_steps/total_steps], [linear_schedule(warmup_ratio*y0, y0), func])        
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, (lambda step: func((step + start_step)/total_steps)))
 
 class ChunkDataSet:
     def __init__(self, chunks, chunk_lengths, targets, target_lengths):
@@ -81,8 +107,39 @@ def load_state(dirname, device, model, optim, use_amp=False):
     return epoch
 
 
-def train(model, device, train_loader, optimizer, use_amp=False):
+class CSVLogger():
+    def __init__(self, work_dir, name='logs'):
+        self.fname = os.path.join(work_dir, '%s.csv' % name)
+        if os.path.exists(self.fname):
+            self.keys = list(self.to_df().columns)
+        else:
+            self.keys = None
 
+    def append(self, row):
+        with open(self.fname, 'a', newline='') as csvfile:
+            c = csv.writer(csvfile, delimiter=',')
+            if self.keys is None:
+                self.keys = list(row.keys())
+                c.writerow(self.keys)
+            c.writerow([row.get(k, '-') for k in self.keys])
+
+    def to_df(self):
+        return pd.read_csv(self.fname)
+
+
+def ctc_label_smoothing_loss(log_probs, targets, input_lengths, target_lengths, weights):
+    ctc_loss = torch.nn.functional.ctc_loss(log_probs, targets, input_lengths, target_lengths, reduction='mean')
+    label_smoothing_loss = -((log_probs * weights.to(log_probs.device)).mean())
+    return {'loss': ctc_loss + label_smoothing_loss, 'ctc_loss': ctc_loss, 'label_smooth_loss': label_smoothing_loss}
+
+
+def train(model, device, train_loader, optimizer, use_amp=False, criterion=None, lr_scheduler=None, loss_log=None):
+    
+    if criterion is None:
+        C = len(model.alphabet)
+        weights = torch.cat([torch.tensor([0.4]), (0.1 / (C - 1)) * torch.ones(C - 1)]).to(device)
+        criterion = partial(ctc_label_smoothing_loss, weights=weights)
+ 
     chunks = 0
     model.train()
     t0 = time.perf_counter()
@@ -91,34 +148,41 @@ def train(model, device, train_loader, optimizer, use_amp=False):
         total=len(train_loader), desc='[0/{}]'.format(len(train_loader.dataset)),
         ascii=True, leave=True, ncols=100, bar_format='{l_bar}{bar}| [{elapsed}{postfix}]'
     )
-
+    smoothed_loss = {}
     with progress_bar:
-
         for data, out_lengths, target, lengths in train_loader:
-
             optimizer.zero_grad()
-
             chunks += data.shape[0]
 
             data = data.to(device)
             target = target.to(device)
             log_probs = model(data)
 
-            loss = criterion(log_probs.transpose(0, 1), target, out_lengths / model.stride, lengths)
+            losses = criterion(log_probs.transpose(0, 1), target, out_lengths / model.stride, lengths)
+            if not isinstance(losses, dict):
+                losses = {'loss': losses}
 
             if use_amp:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
+                with amp.scale_loss(losses['loss'], optimizer) as scaled_loss:
                     scaled_loss.backward()
             else:
-                loss.backward()
+                losses['loss'].backward()
 
             optimizer.step()
+            if lr_scheduler is not None: 
+                lr_scheduler.step()
 
-            progress_bar.set_postfix(loss='%.4f' % loss.item())
+            if not smoothed_loss:
+                smoothed_loss = {k: v.item() for k,v in losses.items()}
+            smoothed_loss = {k: 0.01*v.item() + 0.99*smoothed_loss[k] for k,v in losses.items()}
+            
+            if loss_log is not None:
+                loss_log.append(union(smoothed_loss, {'chunks': chunks, 'time': time.perf_counter() - t0}))
+            progress_bar.set_postfix(loss='%.4f' % smoothed_loss['loss'])
             progress_bar.set_description("[{}/{}]".format(chunks, len(train_loader.dataset)))
             progress_bar.update()
 
-    return loss.item(), time.perf_counter() - t0
+    return smoothed_loss['loss'], time.perf_counter() - t0
 
 
 def test(model, device, test_loader):

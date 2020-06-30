@@ -35,6 +35,9 @@ split_cigar = re.compile(r"(?P<len>\d+)(?P<op>\D+)")
 default_data = os.path.join(__data__, "dna_r9.4.1")
 default_config = os.path.join(__configs__, "dna_r9.4.1.toml")
 
+def union(*dicts):
+    return {k: v for d in dicts for (k, v) in d.items()}
+
 
 def init(seed, device):
     """
@@ -308,3 +311,5 @@ def poa(groups, max_sequences_per_poa=100, gpu_mem_per_batch=0.9):
             group_status, seq_status = batch.add_poa_group(group)
 
     return results
+
+
