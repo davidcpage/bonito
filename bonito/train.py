@@ -5,10 +5,11 @@ Bonito training.
 """
 
 import os
-import csv
 from datetime import datetime
 from argparse import ArgumentParser
 from argparse import ArgumentDefaultsHelpFormatter
+
+from collections import OrderedDict as odict
 
 from bonito.model import Model
 from bonito.training import (
@@ -92,11 +93,11 @@ def main(args):
         torch.save(model_state, os.path.join(workdir, "weights_%s.tar" % epoch))
         torch.save(optimizer.state_dict(), os.path.join(workdir, "optim_%s.tar" % epoch))
  
-        training_log.append({
-            'time': datetime.today(), 'duration': duration, 'epoch': epoch, 'train_loss': train_loss, 
-            'validation_loss': val_loss, 'validation_mean': val_mean, 'validation_median': val_median, 
-            'lr': optimizer.param_groups[0]['lr']
-        })       
+        training_log.append(odict([
+            ('time', datetime.today()), ('duration', duration), ('epoch', epoch), 
+            ('lr', optimizer.param_groups[0]['lr']), ('train_loss', train_loss), 
+            ('validation_loss', val_loss), ('validation_mean', val_mean), ('validation_median', val_median),
+        ]))       
 
 
 def argparser():

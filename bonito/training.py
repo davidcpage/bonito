@@ -8,6 +8,7 @@ import time
 from glob import glob
 from itertools import starmap
 from functools import partial
+import csv
 
 from bonito.util import accuracy, decode_ref, load_data, union
 
@@ -19,7 +20,6 @@ import pandas as pd
 
 try: from apex import amp
 except ImportError: pass
-
 
 def const_schedule(y):
     return lambda t: y
@@ -127,6 +127,7 @@ class CSVLogger():
         return pd.read_csv(self.fname)
 
 
+    
 def ctc_label_smoothing_loss(log_probs, targets, input_lengths, target_lengths, weights):
     ctc_loss = torch.nn.functional.ctc_loss(log_probs, targets, input_lengths, target_lengths, reduction='mean')
     label_smoothing_loss = -((log_probs * weights.to(log_probs.device)).mean())
@@ -196,7 +197,7 @@ def test(model, device, test_loader):
         for batch_idx, (data, out_lengths, target, lengths) in enumerate(test_loader, start=1):
             data, target = data.to(device), target.to(device)
             log_probs = model(data)
-            test_loss += criterion(log_probs.transpose(1, 0), target, out_lengths / model.stride, lengths)
+            test_loss += torch.nn.functional.ctc_loss(log_probs.transpose(1, 0), target, out_lengths / model.stride, lengths, reduction='mean')
             predictions.append(torch.exp(log_probs).cpu())
             prediction_lengths.append(out_lengths / model.stride)
 
